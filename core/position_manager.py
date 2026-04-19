@@ -1,5 +1,4 @@
 """仓位管理：开仓、平仓、查询持仓，通过 Binance 合约接口执行。"""
-import time
 from typing import Dict, List, Optional
 
 from loguru import logger
@@ -7,6 +6,12 @@ from loguru import logger
 from config import CFG
 from core.data_fetcher import DataFetcher
 from core.risk_manager import RiskManager
+
+
+# Tolerance constants for post-order secondary verification
+_VERIFY_SIZE_DIFF_PCT = 0.05    # warn if actual qty deviates >5% from expected
+_VERIFY_MIN_QTY = 1e-9          # float-safe lower bound for quantity comparisons
+_VERIFY_MIN_TOLERANCE = 1e-6    # absolute floor for close-verification tolerance
 
 
 class PositionManager:
@@ -85,49 +90,86 @@ class PositionManager:
         return None
 
     # ------------------------------------------------------------------
-    # Order verification helpers
+    # Post-order secondary verification helpers
     # ------------------------------------------------------------------
 
-    def _verify_position_open(self, symbol: str) -> bool:
-        """验证开仓指令已成交：轮询持仓确认数量大于 0。
+    def _verify_position_opened(self, symbol: str, expected_qty: float) -> bool:
+        """开仓后二次验证：从交易所重新拉取持仓，确认仓位已实际建立。
 
-        最多重试 ``CFG.ORDER_VERIFY_RETRIES`` 次，每次间隔
-        ``CFG.ORDER_VERIFY_DELAY_SEC`` 秒。未能确认时记录告警但不阻塞流程。
+        Parameters
+        ----------
+        symbol:
+            合约标的。
+        expected_qty:
+            预期开仓数量，用于比对实际成交量是否合理。
+
+        Returns
+        -------
+        bool
+            True 表示持仓已确认存在；False 表示持仓未找到或数量严重偏差。
         """
-        for attempt in range(CFG.ORDER_VERIFY_RETRIES):
-            pos = self.get_position(symbol)
-            if pos is not None and pos["size"] > 0:
-                logger.info(
-                    f"[PositionManager] open confirmed for {symbol} "
-                    f"size={pos['size']:.6f} entry={pos['entry_price']}"
-                )
-                return True
-            if attempt < CFG.ORDER_VERIFY_RETRIES - 1:
-                time.sleep(CFG.ORDER_VERIFY_DELAY_SEC)
-        logger.warning(
-            f"[PositionManager] open NOT confirmed for {symbol} "
-            f"after {CFG.ORDER_VERIFY_RETRIES} retries"
-        )
-        return False
+        if not expected_qty > _VERIFY_MIN_QTY:
+            # 无效 qty 输入（负数或极小值），仍可确认持仓存在
+            logger.warning(
+                f"[PositionManager] _verify_position_opened called with "
+                f"expected_qty={expected_qty:.6f} for {symbol}; skipping qty comparison"
+            )
+            return pos is not None
+        pos = self.get_position(symbol)
+        if pos is None:
+            logger.error(
+                f"[PositionManager] POST-OPEN VERIFY FAILED: no position found for "
+                f"{symbol} after market order (expected qty≈{expected_qty:.6f}) – "
+                "possible unfilled order or exchange error"
+            )
+            return False
+        actual_qty = pos["size"]
+        # 允许 _VERIFY_SIZE_DIFF_PCT 以内的尾差（市价单滑点/部分成交）
+        if abs(actual_qty - expected_qty) / expected_qty > _VERIFY_SIZE_DIFF_PCT:
+            logger.warning(
+                f"[PositionManager] POST-OPEN VERIFY WARNING: {symbol} "
+                f"expected qty={expected_qty:.6f} but actual={actual_qty:.6f} "
+                f"(diff={abs(actual_qty - expected_qty) / expected_qty:.1%})"
+            )
+        else:
+            logger.info(
+                f"[PositionManager] post-open verified: {symbol} "
+                f"size={actual_qty:.6f} entry={pos['entry_price']:.6f}"
+            )
+        return True
 
-    def _verify_position_closed(self, symbol: str) -> bool:
-        """验证全仓平仓已成交：轮询持仓确认已归零。
+    def _verify_position_closed(self, symbol: str, expected_remaining: float) -> bool:
+        """平仓后二次验证：从交易所重新拉取持仓，确认仓位已按预期减少或清零。
 
-        最多重试 ``CFG.ORDER_VERIFY_RETRIES`` 次，每次间隔
-        ``CFG.ORDER_VERIFY_DELAY_SEC`` 秒。未能确认时记录告警但不阻塞流程。
+        Parameters
+        ----------
+        symbol:
+            合约标的。
+        expected_remaining:
+            平仓后预期剩余数量（全部平仓时为 0）。
+
+        Returns
+        -------
+        bool
+            True 表示持仓与预期一致；False 表示持仓仍异常存在或数量不符。
         """
-        for attempt in range(CFG.ORDER_VERIFY_RETRIES):
-            pos = self.get_position(symbol)
-            if pos is None or pos["size"] <= 0:
-                logger.info(f"[PositionManager] close confirmed for {symbol}")
-                return True
-            if attempt < CFG.ORDER_VERIFY_RETRIES - 1:
-                time.sleep(CFG.ORDER_VERIFY_DELAY_SEC)
-        logger.warning(
-            f"[PositionManager] close NOT confirmed for {symbol} "
-            f"after {CFG.ORDER_VERIFY_RETRIES} retries"
+        pos = self.get_position(symbol)
+        actual_size = pos["size"] if pos is not None else 0.0
+        tolerance = max(expected_remaining * _VERIFY_SIZE_DIFF_PCT, _VERIFY_MIN_TOLERANCE)
+
+        if abs(actual_size - expected_remaining) > tolerance:
+            logger.error(
+                f"[PositionManager] POST-CLOSE VERIFY MISMATCH for {symbol}: "
+                f"expected remaining={expected_remaining:.6f}, actual={actual_size:.6f} "
+                "– possible partial fill, exchange latency, or stop-order interference"
+            )
+            return False
+
+        logger.info(
+            f"[PositionManager] post-close verified: {symbol} "
+            f"remaining={actual_size:.6f}"
         )
-        return False
+        return True
 
     # ------------------------------------------------------------------
     # Open
@@ -190,6 +232,9 @@ class PositionManager:
                 f"orderId={order.get('id')}"
             )
 
+            # 开仓后二次验证：确认交易所端持仓已实际建立
+            self._verify_position_opened(symbol, quantity)
+
             # 挂止损单
             try:
                 stop_order = self._exchange.create_order(
@@ -205,9 +250,6 @@ class PositionManager:
                 )
             except Exception as sl_exc:
                 logger.warning(f"[PositionManager] stop-loss order failed for {symbol}: {sl_exc}")
-
-            # 二次验证：确认开仓已成交
-            self._verify_position_open(symbol)
 
             return order
 
@@ -417,10 +459,12 @@ class PositionManager:
                         f"cancelling all stop orders"
                     )
                 self._cancel_open_stop_orders(symbol)
-                # 二次验证：全仓平仓确认持仓归零
-                self._verify_position_closed(symbol)
             else:
                 self._adjust_stop_orders(symbol, remaining_qty)
+
+            # 平仓后二次验证：确认交易所端持仓已实际减少或清零
+            expected_remaining = max(remaining_qty, 0.0)
+            self._verify_position_closed(symbol, expected_remaining)
 
             return order
 
