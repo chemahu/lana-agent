@@ -16,6 +16,7 @@ from typing import Dict, List, Set
 _DEFAULT_NAME_PATTERN_PREFIXES = ("user-", "user_", "binance_user", "anon")
 _HIGH_FREQ_THRESHOLD = 20          # 每小时帖数超过此值视为高频
 _MS_1H = 3_600_000
+_CONTENT_HASH_LENGTH = 100         # 用于去重哈希的内容前缀长度
 
 
 def _is_default_name(nickname: str) -> bool:
@@ -31,8 +32,8 @@ def _is_default_name(nickname: str) -> bool:
 
 
 def _content_hash(content: str) -> str:
-    """取内容前 100 字符的 MD5 作为近似去重键。"""
-    snippet = content.strip()[:100].lower()
+    """取内容前 _CONTENT_HASH_LENGTH 字符的 MD5 作为近似去重键。"""
+    snippet = content.strip()[:_CONTENT_HASH_LENGTH].lower()
     return hashlib.md5(snippet.encode("utf-8", errors="replace")).hexdigest()
 
 
