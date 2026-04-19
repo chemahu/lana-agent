@@ -1,16 +1,21 @@
 """AI 决策评估器：调用最多 3 个 LLM（Anthropic Claude / OpenAI GPT / Google Gemini）
-并通过集成投票（majority vote + 概率均值）形成最终交易判断。
+并通过集成投票（少数服从多数 + 多数派概率均值）形成最终交易判断。
 
 集成思路（更容易根据结果判断交易操作）：
   - 每个已配置的 LLM 都会被调用一次，得到独立的 JSON 决策；
-  - 入场 should_enter / 持仓 action 采用多数投票；
-  - p_up、confidence、scale_out_pct 取算术均值；
-  - key_reason / risks 拼接所有模型的简要理由，便于人工复盘；
-  - 投票一致 → 高把握执行；分歧 → 自动降低 confidence，由阈值过滤；
-  - 全部 LLM 调用失败时回退到内置规则引擎。
+  - 入场 should_enter / 持仓 action 采用**少数服从多数**：得票最多的取胜，平票时按
+    第一个出现的取胜（行为稳定，便于回放）；
+  - p_up、confidence、scale_out_pct **只在多数派内部取均值**，少数派意见仅作记录、
+    不稀释多数派的把握度；
+  - key_reason / risks 拼接所有模型的简要理由（多数派在前），方便人工复盘；
+  - 全部 LLM 调用失败时回退到内置规则引擎；
+  - **每次决策**都会向 ``CFG.CONSULTATION_LOG_PATH`` 追加一行 JSON 会商记录，
+    包含各模型原始输出、投票明细、最终结论，用于事后复盘。
 """
 import json
-from typing import Callable, Dict, List, Optional, Tuple
+import os
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -237,24 +242,27 @@ class AIEvaluator:
 
     @classmethod
     def _aggregate_entry(cls, results: List[Tuple[str, Dict]]) -> Dict:
-        """集成入场决策：should_enter 多数投票，p_up/confidence 取均值。"""
+        """集成入场决策：should_enter 按少数服从多数，p_up/confidence 仅在多数派内取均值。"""
         if not results:
             raise RuntimeError("no LLM results to aggregate")
 
         votes = [bool(r.get("should_enter", False)) for _, r in results]
         winner, win_count, total = cls._majority_vote(votes, False)
 
-        p_up = cls._avg([r.get("p_up", 0.5) for _, r in results], 0.5)
-        confidence = cls._avg([r.get("confidence", 0.5) for _, r in results], 0.5)
-        # 投票分歧时降低 confidence（按一致比例线性缩放）
-        agreement = win_count / total if total else 1.0
-        confidence *= agreement
+        # 只对多数派取均值，少数票不稀释多数派的 p_up / confidence
+        winners = [(name, r) for (name, r), v in zip(results, votes) if v == winner]
+        dissenters = [(name, r) for (name, r), v in zip(results, votes) if v != winner]
 
+        p_up = cls._avg([r.get("p_up", 0.5) for _, r in winners], 0.5)
+        confidence = cls._avg([r.get("confidence", 0.5) for _, r in winners], 0.5)
+
+        # 多数派在前，少数派在后，便于人工对照
+        ordered = winners + dissenters
         reason = " | ".join(
-            f"{name}:{(r.get('key_reason') or '')[:60]}" for name, r in results
+            f"{name}:{(r.get('key_reason') or '')[:60]}" for name, r in ordered
         )
         risks = " | ".join(
-            f"{name}:{(r.get('risks') or '')[:60]}" for name, r in results
+            f"{name}:{(r.get('risks') or '')[:60]}" for name, r in ordered
         )
         return {
             "should_enter": bool(winner),
@@ -263,30 +271,36 @@ class AIEvaluator:
             "key_reason": reason[:240],
             "risks": risks[:240],
             "votes": {
-                "agreement": round(agreement, 3),
+                "winner": bool(winner),
+                "win_count": win_count,
+                "total": total,
                 "models": [name for name, _ in results],
+                "majority": [name for name, _ in winners],
+                "dissenters": [name for name, _ in dissenters],
             },
         }
 
     @classmethod
     def _aggregate_hold(cls, results: List[Tuple[str, Dict]]) -> Dict:
-        """集成持仓决策：action 多数投票，scale_out_pct/p_up 取均值。"""
+        """集成持仓决策：action 按少数服从多数，scale_out_pct/p_up/confidence 仅在多数派内取均值。"""
         if not results:
             raise RuntimeError("no LLM results to aggregate")
 
         actions = [str(r.get("action", "hold")).lower() for _, r in results]
         winner, win_count, total = cls._majority_vote(actions, "hold")
 
-        scale_out_pct = cls._avg(
-            [r.get("scale_out_pct", 0.0) for _, r in results], 0.0
-        )
-        p_up = cls._avg([r.get("p_up", 0.5) for _, r in results], 0.5)
-        confidence = cls._avg([r.get("confidence", 0.5) for _, r in results], 0.5)
-        agreement = win_count / total if total else 1.0
-        confidence *= agreement
+        winners = [(name, r) for (name, r), a in zip(results, actions) if a == winner]
+        dissenters = [(name, r) for (name, r), a in zip(results, actions) if a != winner]
 
+        scale_out_pct = cls._avg(
+            [r.get("scale_out_pct", 0.0) for _, r in winners], 0.0
+        )
+        p_up = cls._avg([r.get("p_up", 0.5) for _, r in winners], 0.5)
+        confidence = cls._avg([r.get("confidence", 0.5) for _, r in winners], 0.5)
+
+        ordered = winners + dissenters
         reason = " | ".join(
-            f"{name}:{(r.get('key_reason') or '')[:60]}" for name, r in results
+            f"{name}:{(r.get('key_reason') or '')[:60]}" for name, r in ordered
         )
         return {
             "action": winner,
@@ -295,10 +309,73 @@ class AIEvaluator:
             "confidence": round(max(0.0, min(1.0, confidence)), 3),
             "key_reason": reason[:240],
             "votes": {
-                "agreement": round(agreement, 3),
+                "winner": winner,
+                "win_count": win_count,
+                "total": total,
                 "models": [name for name, _ in results],
+                "majority": [name for name, _ in winners],
+                "dissenters": [name for name, _ in dissenters],
+                "actions": dict(zip([n for n, _ in results], actions)),
             },
         }
+
+    # ------------------------------------------------------------------
+    # Consultation log (会商记录)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _record_consultation(
+        symbol: str,
+        mode: str,
+        results: List[Tuple[str, Dict]],
+        final: Dict,
+        snapshot_summary: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """将一次 LLM 集成会商完整落盘为一行 JSON，便于事后复盘。
+
+        失败不抛异常 —— 记录写入失败不应影响交易主流程。
+        """
+        path = getattr(CFG, "CONSULTATION_LOG_PATH", "") or ""
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            record = {
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "symbol": symbol,
+                "mode": mode,
+                "models": [
+                    {"name": name, "response": resp}
+                    for name, resp in results
+                ],
+                "final": final,
+            }
+            if snapshot_summary:
+                record["snapshot"] = snapshot_summary
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except Exception as exc:  # pragma: no cover - best-effort logging
+            logger.warning(f"[AIEvaluator] consultation log write failed: {exc}")
+
+    @staticmethod
+    def _snapshot_summary(snapshot: Dict) -> Dict[str, Any]:
+        """从原始 snapshot 中抽取关键特征作为复盘上下文。"""
+        price = snapshot.get("price", {}) or {}
+        deriv = snapshot.get("derivatives", {}) or {}
+        social = snapshot.get("social", {}) or {}
+        volume = snapshot.get("volume", {}) or {}
+        return {
+            "current_price": price.get("current_price"),
+            "change_1h": price.get("change_1h"),
+            "change_4h": price.get("change_4h"),
+            "change_24h": price.get("change_24h"),
+            "oi_change_4h": deriv.get("oi_change_4h"),
+            "funding_rate": deriv.get("funding_rate"),
+            "posts_1h": social.get("posts_1h"),
+            "kol_mentioned": social.get("kol_mentioned"),
+            "volume_vs_avg_24h": volume.get("volume_vs_avg_24h"),
+        }
+
 
     # ------------------------------------------------------------------
     # Rule-based fallback
@@ -366,16 +443,22 @@ class AIEvaluator:
             result.setdefault("confidence", 0.5)
             result.setdefault("key_reason", "")
             result.setdefault("risks", "")
-            # enforce thresholds (集成后 confidence 已被一致性缩放，再过一次阈值)
+            # 少数服从多数后再过一次入场阈值（confidence 已是多数派均值，不再缩放）
             if (result["p_up"] < CFG.ENTRY_P_UP_THRESHOLD
                     or result["confidence"] < CFG.ENTRY_CONFIDENCE_THRESHOLD):
                 result["should_enter"] = False
+            votes = result.get("votes", {})
             logger.info(
                 f"[AIEvaluator] entry {symbol}: should_enter={result['should_enter']} "
                 f"p_up={result['p_up']:.2f} conf={result['confidence']:.2f} "
-                f"agreement={result.get('votes', {}).get('agreement', 1.0):.2f} "
-                f"models={result.get('votes', {}).get('models', [])} "
+                f"vote={votes.get('win_count', '?')}/{votes.get('total', '?')} "
+                f"majority={votes.get('majority', [])} "
+                f"dissenters={votes.get('dissenters', [])} "
                 f"reason={result['key_reason']!r}"
+            )
+            self._record_consultation(
+                symbol, "entry", results, result,
+                snapshot_summary=self._snapshot_summary(snapshot),
             )
             return result
         except Exception as exc:
@@ -401,12 +484,18 @@ class AIEvaluator:
             result.setdefault("p_up", 0.5)
             result.setdefault("confidence", 0.5)
             result.setdefault("key_reason", "")
+            votes = result.get("votes", {})
             logger.info(
                 f"[AIEvaluator] hold {symbol}: action={result['action']} "
                 f"p_up={result['p_up']:.2f} conf={result['confidence']:.2f} "
-                f"agreement={result.get('votes', {}).get('agreement', 1.0):.2f} "
-                f"models={result.get('votes', {}).get('models', [])} "
+                f"vote={votes.get('win_count', '?')}/{votes.get('total', '?')} "
+                f"majority={votes.get('majority', [])} "
+                f"dissenters={votes.get('dissenters', [])} "
                 f"reason={result['key_reason']!r}"
+            )
+            self._record_consultation(
+                symbol, "hold", results, result,
+                snapshot_summary=self._snapshot_summary(snapshot),
             )
             return result
         except Exception as exc:

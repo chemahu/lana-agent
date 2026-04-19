@@ -40,6 +40,13 @@ class TradingConfig:
     HIGH_ROI_THRESHOLD: float = 1.0
     BREAKEVEN_ROI_TRIGGER: float = 0.05  # 浮盈达此比例时将止损移至保本价
 
+    # —— 会商记录 ——
+    # 每次 LLM 集成决策的完整输入/输出落盘到此 JSONL 文件，便于复盘。
+    # 路径相对工作目录；目录不存在时会自动创建。
+    CONSULTATION_LOG_PATH: str = os.getenv(
+        "CONSULTATION_LOG_PATH", "logs/consultations.jsonl"
+    )
+
     # —— 仓位限制 ——
     MAX_OPEN_POSITIONS: int = 5
 
