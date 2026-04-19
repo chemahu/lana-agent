@@ -162,11 +162,90 @@ class PositionManager:
             return None
 
     # ------------------------------------------------------------------
+    # Stop-order helpers
+    # ------------------------------------------------------------------
+
+    def _cancel_open_stop_orders(self, symbol: str) -> None:
+        """撤销指定标的所有挂单中的 stop_market reduceOnly 卖单（止损挂单）。
+
+        在全部平仓后调用，确保不会有残留止损单误触发后续仓位。
+        """
+        try:
+            open_orders = self._exchange.fetch_open_orders(symbol)
+            for order in open_orders:
+                if (
+                    order.get("type") in ("stop_market", "stop")
+                    and order.get("reduceOnly")
+                    and order.get("side", "").lower() == "sell"
+                ):
+                    self._exchange.cancel_order(order["id"], symbol)
+                    logger.info(
+                        f"[PositionManager] cancelled stop order {order['id']} for {symbol}"
+                    )
+        except Exception as exc:
+            logger.error(
+                f"[PositionManager] cancel open stop orders failed for {symbol}: {exc}"
+            )
+
+    def _adjust_stop_orders(self, symbol: str, remaining_qty: float) -> None:
+        """撤销旧止损单并按剩余仓位数量重新挂单（减仓后调用）。
+
+        Parameters
+        ----------
+        symbol:
+            合约标的。
+        remaining_qty:
+            减仓后剩余的多头数量。
+        """
+        try:
+            open_orders = self._exchange.fetch_open_orders(symbol)
+            for order in open_orders:
+                if (
+                    order.get("type") in ("stop_market", "stop")
+                    and order.get("reduceOnly")
+                    and order.get("side", "").lower() == "sell"
+                ):
+                    stop_price = float(
+                        order.get("stopPrice")
+                        or order.get("info", {}).get("stopPrice", 0)
+                        or 0
+                    )
+                    self._exchange.cancel_order(order["id"], symbol)
+                    logger.info(
+                        f"[PositionManager] cancelled stop order {order['id']} for {symbol}"
+                    )
+                    if stop_price > 0:
+                        new_stop = self._exchange.create_order(
+                            symbol=symbol,
+                            type="stop_market",
+                            side="sell",
+                            amount=remaining_qty,
+                            params={"stopPrice": stop_price, "reduceOnly": True},
+                        )
+                        logger.info(
+                            f"[PositionManager] re-placed stop order for {symbol} "
+                            f"qty={remaining_qty:.6f} @ {stop_price:.6f} "
+                            f"orderId={new_stop.get('id')}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[PositionManager] stop price not found for order "
+                            f"{order['id']} of {symbol}; skipped re-placement"
+                        )
+        except Exception as exc:
+            logger.error(
+                f"[PositionManager] adjust stop orders failed for {symbol}: {exc}"
+            )
+
+    # ------------------------------------------------------------------
     # Close
     # ------------------------------------------------------------------
 
     def close_long(self, symbol: str, quantity: Optional[float] = None) -> Optional[Dict]:
         """平多单（全部或部分）。
+
+        平仓成功后自动撤销或调整对应的 stop_market reduceOnly 止损挂单，
+        避免残留止损单误触发后续仓位。
 
         Parameters
         ----------
@@ -205,6 +284,20 @@ class PositionManager:
                 f"[PositionManager] CLOSE LONG {symbol} "
                 f"qty={close_qty:.6f} orderId={order.get('id')}"
             )
+
+            # 撤销或调整止损挂单，防止残留单误触发
+            remaining_qty = pos["size"] - close_qty
+            if remaining_qty <= 0:
+                if remaining_qty < 0:
+                    logger.warning(
+                        f"[PositionManager] close qty ({close_qty:.6f}) exceeds recorded "
+                        f"position size ({pos['size']:.6f}) for {symbol}; "
+                        f"cancelling all stop orders"
+                    )
+                self._cancel_open_stop_orders(symbol)
+            else:
+                self._adjust_stop_orders(symbol, remaining_qty)
+
             return order
 
         except Exception as exc:
