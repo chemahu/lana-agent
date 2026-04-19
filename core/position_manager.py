@@ -8,6 +8,12 @@ from core.data_fetcher import DataFetcher
 from core.risk_manager import RiskManager
 
 
+# Tolerance constants for post-order secondary verification
+_VERIFY_SIZE_DIFF_PCT = 0.05    # warn if actual qty deviates >5% from expected
+_VERIFY_MIN_QTY = 1e-9          # float-safe lower bound for quantity comparisons
+_VERIFY_MIN_TOLERANCE = 1e-6    # absolute floor for close-verification tolerance
+
+
 class PositionManager:
     """封装 Binance USDM 合约的开仓 / 平仓 / 持仓查询逻辑。
 
@@ -102,6 +108,13 @@ class PositionManager:
         bool
             True 表示持仓已确认存在；False 表示持仓未找到或数量严重偏差。
         """
+        if not expected_qty > _VERIFY_MIN_QTY:
+            # 无效 qty 输入（负数或极小值），仍可确认持仓存在
+            logger.warning(
+                f"[PositionManager] _verify_position_opened called with "
+                f"expected_qty={expected_qty:.6f} for {symbol}; skipping qty comparison"
+            )
+            return pos is not None
         pos = self.get_position(symbol)
         if pos is None:
             logger.error(
@@ -111,8 +124,8 @@ class PositionManager:
             )
             return False
         actual_qty = pos["size"]
-        # 允许5%以内的尾差（市价单滑点/部分成交）
-        if expected_qty > 1e-9 and abs(actual_qty - expected_qty) / expected_qty > 0.05:
+        # 允许 _VERIFY_SIZE_DIFF_PCT 以内的尾差（市价单滑点/部分成交）
+        if abs(actual_qty - expected_qty) / expected_qty > _VERIFY_SIZE_DIFF_PCT:
             logger.warning(
                 f"[PositionManager] POST-OPEN VERIFY WARNING: {symbol} "
                 f"expected qty={expected_qty:.6f} but actual={actual_qty:.6f} "
@@ -142,7 +155,7 @@ class PositionManager:
         """
         pos = self.get_position(symbol)
         actual_size = pos["size"] if pos is not None else 0.0
-        tolerance = max(expected_remaining * 0.05, 1e-6)
+        tolerance = max(expected_remaining * _VERIFY_SIZE_DIFF_PCT, _VERIFY_MIN_TOLERANCE)
 
         if abs(actual_size - expected_remaining) > tolerance:
             logger.error(

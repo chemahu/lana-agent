@@ -11,6 +11,11 @@ from core.risk_manager import RiskManager
 from utils.notifier import notify
 
 
+# Threshold constants for position reconciliation
+_RECONCILE_ZERO_THRESHOLD = 1e-9   # float-safe lower bound for size comparisons
+_RECONCILE_SIZE_DIFF_PCT = 0.05    # warn if live size deviates >5% from stale snapshot
+
+
 class TrailingEvaluator:
     """对所有当前持仓逐一抓取快照、调用 AI 评估，并执行相应操作。
 
@@ -70,9 +75,9 @@ class TrailingEvaluator:
 
         stale_size = stale_pos.get("size", 0)
         fresh_size = fresh.get("size", 0)
-        if stale_size > 0:
+        if stale_size > _RECONCILE_ZERO_THRESHOLD:
             size_diff_pct = abs(fresh_size - stale_size) / stale_size
-            if size_diff_pct > 0.05:
+            if size_diff_pct > _RECONCILE_SIZE_DIFF_PCT:
                 logger.warning(
                     f"[Trailing] reconcile: {symbol} stale_size={stale_size:.6f} "
                     f"fresh_size={fresh_size:.6f} (diff={size_diff_pct:.1%}) – "
