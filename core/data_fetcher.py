@@ -95,6 +95,40 @@ class DataFetcher:
                      if g["symbol"] == symbol), 999)
         return {"rank_in_gainers": rank, "gainers_count": len(gainers)}
 
+    def get_volume_features(self, symbol: str) -> Dict:
+        """Volume dimension: 24h aggregated and 1h relative volume for momentum confirmation."""
+        try:
+            ohlcv_1h = self.exchange.fetch_ohlcv(symbol, "1h", limit=24)
+            closes = [c[4] for c in ohlcv_1h]
+            volumes = [c[5] for c in ohlcv_1h]
+            # Convert base-currency volume to USDT-equivalent using each candle's close
+            usdt_volumes = [v * c for v, c in zip(volumes, closes)]
+            volume_24h = sum(usdt_volumes)
+            avg_hourly = volume_24h / len(usdt_volumes) if usdt_volumes else 1.0
+            volume_change_1h = (usdt_volumes[-1] / avg_hourly - 1) if avg_hourly > 0 else 0.0
+            # Estimate buy-side pressure from last 3 candles (green candle volume / total)
+            n_tail = min(3, len(usdt_volumes))
+            buy_vol = sum(
+                usdt_volumes[i] for i in range(-n_tail, 0)
+                if closes[i] >= ohlcv_1h[i][1]  # close >= open → green candle
+            )
+            total_last3 = sum(usdt_volumes[-n_tail:]) or 1.0
+            buy_volume_ratio = buy_vol / total_last3
+            return {
+                "volume_24h_usdt": round(volume_24h, 2),
+                "avg_hourly_volume_usdt": round(avg_hourly, 2),
+                "volume_change_1h": round(volume_change_1h, 4),
+                "buy_volume_ratio": round(buy_volume_ratio, 3),
+            }
+        except Exception as e:
+            logger.warning(f"volume features fetch failed for {symbol}: {e}")
+            return {
+                "volume_24h_usdt": 0.0,
+                "avg_hourly_volume_usdt": 0.0,
+                "volume_change_1h": 0.0,
+                "buy_volume_ratio": 0.5,
+            }
+
     def snapshot(self, symbol: str, gainers: Optional[List] = None) -> Dict:
         gainers = gainers or self.get_top_gainers()
         return {
@@ -102,6 +136,7 @@ class DataFetcher:
             "timestamp": datetime.utcnow().isoformat(),
             "price": self.get_price_features(symbol),
             "derivatives": self.get_derivatives_features(symbol),
+            "volume": self.get_volume_features(symbol),
             "social": self.get_social_features(symbol),
             "relative": self.get_relative_features(symbol, gainers),
         }

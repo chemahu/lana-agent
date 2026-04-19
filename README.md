@@ -28,9 +28,10 @@
    └───────┬────────┘         └───────┬────────┘
            │                          │
    ┌───────▼────────────────────────────▼────────┐
-   │           AI 评估层 (Claude 或 GPT)          │
+   │  AI 评估层 (Claude + GPT 并行交叉验证)          │
    │  - 入场判断（evaluate_entry）                │
    │  - 持仓"继续持有/减仓/全平"（evaluate_hold） │
+   │  - 两模型均可用时并行调用、保守合并结果       │
    │  - 无 LLM 时降级为规则引擎兜底               │
    └───────┬────────────────────────┬────────────┘
            │                        │
@@ -93,11 +94,25 @@
    - `action = "scale_out"` + `scale_out_pct`（限制在 10%–90%）→ 按比例减仓
    - `action = "hold"` → 继续持有
 
-### 3.5 AI 评估模型
+### 3.5 AI 评估模型（双模型交叉验证）
 
-- 优先使用 Anthropic Claude（`claude-3-5-sonnet-20241022`）
-- 未配置 Claude 则回落到 OpenAI GPT（`gpt-4o-mini`）
-- 两者均未配置时使用内置规则引擎（基于动量、OI、KOL 提及计算 p_up）
+- **双模型并行**：同时配置 `ANTHROPIC_API_KEY` 和 `OPENAI_API_KEY` 时，Claude 与 GPT 通过 `ThreadPoolExecutor` **并行**调用，对同一"市场快照"各自独立判断，结果保守合并：
+  - **入场**：两个模型均返回 `should_enter=true` 才最终入场（AND 逻辑），避免单模型幻觉误触发；`p_up` 与 `confidence` 取均值。
+  - **持仓**：取两个模型操作中更保守（close > scale_out > hold）的那一侧；`scale_out_pct` 取均值。
+- **单模型降级**：只配置其中一个 API Key 则使用该单模型，行为与之前一致。
+- **规则引擎兜底**：两者均未配置时使用内置动量规则（基于 momentum、OI、KOL 提及、成交量计算 p_up）。
+
+### 3.6 市场快照（5 个维度）
+
+AI 决策的输入为标准化的 5 维市场快照，每轮评估前实时抓取：
+
+| 维度 | 字段 | 说明 |
+|---|---|---|
+| **price** | current_price, change_1h/4h/24h, distance_from_24h_high, consecutive_green_candles, upper_wick_ratio_avg | 价格动量与 K 线形态 |
+| **derivatives** | oi_change_1h/4h, funding_rate, current_oi_usd | 合约持仓量与资金费率 |
+| **volume** | volume_24h_usdt, avg_hourly_volume_usdt, volume_change_1h, buy_volume_ratio | 成交量强度与多空比 |
+| **social** | posts_1h/24h, posts_growth_rate, unique_authors, bullish_tag_ratio, kol_mentioned, trade_widget_count | 币安广场舆论热度 |
+| **relative** | rank_in_gainers, gainers_count | 标的在涨幅榜中的相对排名 |
 
 ### 3.6 黑天鹅兜底
 
@@ -151,7 +166,8 @@ TELEGRAM_CHAT_ID=xxx
 
 | 功能 | 状态 | 说明 |
 |---|---|---|
-| 双模型交叉验证 | ❌ 未实现 | 当前为单模型顺序回落 |
+| 双模型交叉验证 | ✅ 已实现 | Claude + GPT 并行调用，保守合并结果 |
+| 5 维市场快照 | ✅ 已实现 | price / derivatives / volume / social / relative |
 | 模糊区加快评估 (5min) | ❌ 未实现 | `AMBIGUOUS_INTERVAL_MINUTES` 已定义但未启用 |
 | 高市值币 10× 杠杆 | ❌ 未实现 | 当前仅区分新币(3×)/默认(5×) |
 | API 异常超时兜底 | ❌ 未实现 | `API_FAILURE_TIMEOUT_SEC` 已定义但无对应监控逻辑 |
