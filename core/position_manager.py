@@ -8,6 +8,12 @@ from core.data_fetcher import DataFetcher
 from core.risk_manager import RiskManager
 
 
+# Tolerance constants for post-order secondary verification
+_VERIFY_SIZE_DIFF_PCT = 0.05    # warn if actual qty deviates >5% from expected
+_VERIFY_MIN_QTY = 1e-9          # float-safe lower bound for quantity comparisons
+_VERIFY_MIN_TOLERANCE = 1e-6    # absolute floor for close-verification tolerance
+
+
 class PositionManager:
     """封装 Binance USDM 合约的开仓 / 平仓 / 持仓查询逻辑。
 
@@ -84,6 +90,88 @@ class PositionManager:
         return None
 
     # ------------------------------------------------------------------
+    # Post-order secondary verification helpers
+    # ------------------------------------------------------------------
+
+    def _verify_position_opened(self, symbol: str, expected_qty: float) -> bool:
+        """开仓后二次验证：从交易所重新拉取持仓，确认仓位已实际建立。
+
+        Parameters
+        ----------
+        symbol:
+            合约标的。
+        expected_qty:
+            预期开仓数量，用于比对实际成交量是否合理。
+
+        Returns
+        -------
+        bool
+            True 表示持仓已确认存在；False 表示持仓未找到或数量严重偏差。
+        """
+        if not expected_qty > _VERIFY_MIN_QTY:
+            # 无效 qty 输入（负数或极小值），仍可确认持仓存在
+            logger.warning(
+                f"[PositionManager] _verify_position_opened called with "
+                f"expected_qty={expected_qty:.6f} for {symbol}; skipping qty comparison"
+            )
+            return pos is not None
+        pos = self.get_position(symbol)
+        if pos is None:
+            logger.error(
+                f"[PositionManager] POST-OPEN VERIFY FAILED: no position found for "
+                f"{symbol} after market order (expected qty≈{expected_qty:.6f}) – "
+                "possible unfilled order or exchange error"
+            )
+            return False
+        actual_qty = pos["size"]
+        # 允许 _VERIFY_SIZE_DIFF_PCT 以内的尾差（市价单滑点/部分成交）
+        if abs(actual_qty - expected_qty) / expected_qty > _VERIFY_SIZE_DIFF_PCT:
+            logger.warning(
+                f"[PositionManager] POST-OPEN VERIFY WARNING: {symbol} "
+                f"expected qty={expected_qty:.6f} but actual={actual_qty:.6f} "
+                f"(diff={abs(actual_qty - expected_qty) / expected_qty:.1%})"
+            )
+        else:
+            logger.info(
+                f"[PositionManager] post-open verified: {symbol} "
+                f"size={actual_qty:.6f} entry={pos['entry_price']:.6f}"
+            )
+        return True
+
+    def _verify_position_closed(self, symbol: str, expected_remaining: float) -> bool:
+        """平仓后二次验证：从交易所重新拉取持仓，确认仓位已按预期减少或清零。
+
+        Parameters
+        ----------
+        symbol:
+            合约标的。
+        expected_remaining:
+            平仓后预期剩余数量（全部平仓时为 0）。
+
+        Returns
+        -------
+        bool
+            True 表示持仓与预期一致；False 表示持仓仍异常存在或数量不符。
+        """
+        pos = self.get_position(symbol)
+        actual_size = pos["size"] if pos is not None else 0.0
+        tolerance = max(expected_remaining * _VERIFY_SIZE_DIFF_PCT, _VERIFY_MIN_TOLERANCE)
+
+        if abs(actual_size - expected_remaining) > tolerance:
+            logger.error(
+                f"[PositionManager] POST-CLOSE VERIFY MISMATCH for {symbol}: "
+                f"expected remaining={expected_remaining:.6f}, actual={actual_size:.6f} "
+                "– possible partial fill, exchange latency, or stop-order interference"
+            )
+            return False
+
+        logger.info(
+            f"[PositionManager] post-close verified: {symbol} "
+            f"remaining={actual_size:.6f}"
+        )
+        return True
+
+    # ------------------------------------------------------------------
     # Open
     # ------------------------------------------------------------------
 
@@ -143,6 +231,9 @@ class PositionManager:
                 f"qty={quantity:.6f} @ {entry_price} "
                 f"orderId={order.get('id')}"
             )
+
+            # 开仓后二次验证：确认交易所端持仓已实际建立
+            self._verify_position_opened(symbol, quantity)
 
             # 挂止损单
             try:
@@ -370,6 +461,10 @@ class PositionManager:
                 self._cancel_open_stop_orders(symbol)
             else:
                 self._adjust_stop_orders(symbol, remaining_qty)
+
+            # 平仓后二次验证：确认交易所端持仓已实际减少或清零
+            expected_remaining = max(remaining_qty, 0.0)
+            self._verify_position_closed(symbol, expected_remaining)
 
             return order
 
