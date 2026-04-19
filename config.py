@@ -35,8 +35,11 @@ class TradingConfig:
     ENTRY_P_UP_THRESHOLD: float = 0.6
     ENTRY_CONFIDENCE_THRESHOLD: float = 0.65
     HOLD_P_UP_MARGIN: float = 0.1
-    SCALE_OUT_PCT_RANGE: tuple = (0.01, 0.05)
+    SCALE_OUT_PCT_RANGE: tuple = (0.1, 0.9)
     HIGH_ROI_THRESHOLD: float = 1.0
+
+    # —— 仓位限制 ——
+    MAX_OPEN_POSITIONS: int = 5
 
     # —— Cron 调度 ——
     EVALUATION_INTERVAL_MINUTES: int = 15

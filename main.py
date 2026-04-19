@@ -29,6 +29,12 @@ class LanaAgent:
         logger.info("SCAN CYCLE START")
         candidates = self.scanner.scan()
         held = {p["symbol"] for p in self.position.get_positions()}
+        if len(held) >= CFG.MAX_OPEN_POSITIONS:
+            logger.info(
+                f"[LanaAgent] max open positions ({CFG.MAX_OPEN_POSITIONS}) reached; "
+                "skipping scan"
+            )
+            return
         for c in candidates:
             symbol = c["symbol"]
             if symbol in held:
@@ -38,7 +44,7 @@ class LanaAgent:
             if decision["should_enter"]:
                 result = self.position.open_long(symbol)
                 if result:
-                    notify(f"OPEN LONG {symbol} reason={{decision['key_reason']}}")
+                    notify(f"OPEN LONG {symbol} reason={decision['key_reason']}")
 
     def trailing_check(self):
         logger.info("-" * 60)
@@ -46,10 +52,10 @@ class LanaAgent:
         try:
             self.trailing.evaluate_all()
         except Exception as e:
-            logger.error(f"trailing crashed: {{e}}")
+            logger.error(f"trailing crashed: {e}")
 
     def run(self):
-        notify(f"Lana Agent started (testnet={{CFG.TESTNET}})")
+        notify(f"Lana Agent started (testnet={CFG.TESTNET})")
         self.scan_and_enter()
         self.trailing_check()
         schedule.every(CFG.SCAN_INTERVAL_MINUTES).minutes.do(self.scan_and_enter)
@@ -62,7 +68,7 @@ class LanaAgent:
                 notify("Lana Agent stopped")
                 break
             except Exception as e:
-                logger.error(f"main loop error: {{e}}")
+                logger.error(f"main loop error: {e}")
                 time.sleep(30)
 
 
@@ -77,6 +83,6 @@ if __name__ == '__main__':
     if args.dry_run:
         CFG.DRY_RUN = True
     logger.add("logs/lana_{time}.log", rotation="1 day", retention="30 days")
-    logger.info(f"starting with capital reference: {{args.capital}} USDT")
+    logger.info(f"starting with capital reference: {args.capital} USDT")
     agent = LanaAgent()
     agent.run()
