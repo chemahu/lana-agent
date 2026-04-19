@@ -96,6 +96,11 @@ class PositionManager:
             成功时返回订单信息字典；失败或 dry-run 时返回 None。
         """
         try:
+            # 防止对同一标的重复开仓
+            if self.get_position(symbol) is not None:
+                logger.warning(f"[PositionManager] position already open for {symbol}; skipping")
+                return None
+
             equity = self._get_account_equity()
             if equity <= 0:
                 logger.warning(f"[PositionManager] insufficient equity for {symbol}")
@@ -188,7 +193,10 @@ class PositionManager:
             )
 
     def _adjust_stop_orders(self, symbol: str, remaining_qty: float) -> None:
-        """撤销旧止损单并按剩余仓位数量重新挂单（减仓后调用）。
+        """撤销所有旧止损单并按剩余仓位数量重新挂一个止损单（减仓后调用）。
+
+        先批量撤销所有匹配的止损挂单，再统一挂一个新止损单，
+        避免多次迭代中重复下单导致超额止损覆盖。
 
         Parameters
         ----------
@@ -199,6 +207,7 @@ class PositionManager:
         """
         try:
             open_orders = self._exchange.fetch_open_orders(symbol)
+            stop_prices: list = []
             for order in open_orders:
                 if (
                     order.get("type") in ("stop_market", "stop")
@@ -215,23 +224,28 @@ class PositionManager:
                         f"[PositionManager] cancelled stop order {order['id']} for {symbol}"
                     )
                     if stop_price > 0:
-                        new_stop = self._exchange.create_order(
-                            symbol=symbol,
-                            type="stop_market",
-                            side="sell",
-                            amount=remaining_qty,
-                            params={"stopPrice": stop_price, "reduceOnly": True},
-                        )
-                        logger.info(
-                            f"[PositionManager] re-placed stop order for {symbol} "
-                            f"qty={remaining_qty:.6f} @ {stop_price:.6f} "
-                            f"orderId={new_stop.get('id')}"
-                        )
-                    else:
-                        logger.warning(
-                            f"[PositionManager] stop price not found for order "
-                            f"{order['id']} of {symbol}; skipped re-placement"
-                        )
+                        stop_prices.append(stop_price)
+
+            if stop_prices:
+                # 取最保守（最低）的止损价重新挂单
+                stop_price = min(stop_prices)
+                new_stop = self._exchange.create_order(
+                    symbol=symbol,
+                    type="stop_market",
+                    side="sell",
+                    amount=remaining_qty,
+                    params={"stopPrice": stop_price, "reduceOnly": True},
+                )
+                logger.info(
+                    f"[PositionManager] re-placed stop order for {symbol} "
+                    f"qty={remaining_qty:.6f} @ {stop_price:.6f} "
+                    f"orderId={new_stop.get('id')}"
+                )
+            else:
+                logger.warning(
+                    f"[PositionManager] no valid stop price found for {symbol}; "
+                    "skipped re-placement – position has no stop protection!"
+                )
         except Exception as exc:
             logger.error(
                 f"[PositionManager] adjust stop orders failed for {symbol}: {exc}"
