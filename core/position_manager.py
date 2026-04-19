@@ -112,7 +112,7 @@ class PositionManager:
             return False
         actual_qty = pos["size"]
         # 允许5%以内的尾差（市价单滑点/部分成交）
-        if expected_qty > 0 and abs(actual_qty - expected_qty) / expected_qty > 0.05:
+        if expected_qty > 1e-9 and abs(actual_qty - expected_qty) / expected_qty > 0.05:
             logger.warning(
                 f"[PositionManager] POST-OPEN VERIFY WARNING: {symbol} "
                 f"expected qty={expected_qty:.6f} but actual={actual_qty:.6f} "

@@ -97,7 +97,7 @@ class TrailingEvaluator:
         """
         if self.risk.check_black_swan(symbol, entry_price, current_price):
             # 二次校验：确认持仓确实存在，避免幻影平仓
-            live = self._reconcile_position(symbol, pos or {}) if pos is not None else True
+            live = self._reconcile_position(symbol, pos or {})
             if live is None:
                 logger.warning(
                     f"[Trailing] BLACK SWAN on {symbol} but position already gone; skipping"
@@ -194,7 +194,7 @@ class TrailingEvaluator:
                 scale_pct = max(CFG.SCALE_OUT_PCT_RANGE[0],
                                 min(scale_pct, CFG.SCALE_OUT_PCT_RANGE[1]))
                 # 以最新持仓数量计算减仓绝对数量，避免基于过期 pos 超额平仓
-                scale_qty = live_pos["size"] * scale_pct
+                scale_qty = live_pos.get("size", 0) * scale_pct
                 logger.info(
                     f"[Trailing] AI says SCALE_OUT {symbol} {scale_pct:.0%}: {reason}"
                 )
