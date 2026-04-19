@@ -45,9 +45,11 @@ class PositionManager:
                 entry_price = float(p.get("entryPrice") or p.get("entry_price") or 0)
                 mark_price = float(p.get("markPrice") or p.get("mark_price") or entry_price)
                 pnl = float(p.get("unrealizedPnl") or p.get("unrealized_pnl") or 0)
-                pnl_pct = (
-                    (mark_price / entry_price - 1) if entry_price > 0 else 0.0
-                )
+                side = p.get("side", "long")
+                if entry_price > 0:
+                    pnl_pct = (mark_price / entry_price - 1) if side == "long" else (entry_price / mark_price - 1)
+                else:
+                    pnl_pct = 0.0
                 result.append({
                     "symbol": p["symbol"],
                     "side": p.get("side", "long"),
@@ -118,13 +120,16 @@ class PositionManager:
             order = self._exchange.create_market_buy_order(symbol, qty)
             logger.info(f"[PositionManager] order placed: {order.get('id')}")
 
+            # use the actual filled quantity for the stop-loss to avoid mismatches
+            filled_qty = float(order.get("filled") or order.get("amount") or qty)
+
             # place stop-loss order
             try:
                 self._exchange.create_order(
                     symbol=symbol,
                     type="stop_market",
                     side="sell",
-                    amount=qty,
+                    amount=filled_qty,
                     params={"stopPrice": stop_price, "closePosition": True},
                 )
             except Exception as e:

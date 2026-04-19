@@ -80,9 +80,11 @@ def _call_llm(prompt: str) -> str:
 def _parse_json_response(raw: str) -> Dict:
     """Extract JSON from LLM response, stripping markdown fences if present."""
     text = raw.strip()
-    if text.startswith("```"):
+    if text.startswith("```") and text.endswith("```"):
         lines = text.splitlines()
-        text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
+        # strip opening fence line and closing ``` line
+        inner = lines[1:-1]
+        text = "\n".join(inner).strip()
     return json.loads(text)
 
 
