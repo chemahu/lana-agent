@@ -1,0 +1,133 @@
+"""追踪持仓评估器：对每个持仓周期性调用 AI 判断是否继续持有、减仓或平仓。"""
+from typing import Optional
+
+from loguru import logger
+
+from config import CFG
+from core.ai_evaluator import AIEvaluator
+from core.data_fetcher import DataFetcher
+from core.position_manager import PositionManager
+from core.risk_manager import RiskManager
+from utils.notifier import notify
+
+
+class TrailingEvaluator:
+    """对所有当前持仓逐一抓取快照、调用 AI 评估，并执行相应操作。
+
+    操作逻辑
+    --------
+    * ``close``      → 立即全部平仓
+    * ``scale_out``  → 按 scale_out_pct 部分减仓
+    * ``hold``       → 继续持有（什么都不做）
+
+    同时内置黑天鹅检测（闪跌超阈值时强制平仓）和高盈利止盈逻辑。
+    """
+
+    def __init__(
+        self,
+        fetcher: DataFetcher,
+        position: PositionManager,
+        evaluator: AIEvaluator,
+        risk: RiskManager,
+    ) -> None:
+        self.fetcher = fetcher
+        self.position = position
+        self.evaluator = evaluator
+        self.risk = risk
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_roi(self, entry_price: float, current_price: float) -> float:
+        """计算简单收益率（未考虑杠杆）。"""
+        if entry_price <= 0:
+            return 0.0
+        return (current_price - entry_price) / entry_price
+
+    def _handle_black_swan(self, symbol: str) -> bool:
+        """检测黑天鹅并执行紧急平仓。返回 True 表示已触发。"""
+        if self.risk.check_black_swan(symbol):
+            logger.warning(f"[Trailing] BLACK SWAN detected on {symbol}, closing position")
+            self.position.close_long(symbol)
+            notify(f"⚠️ BLACK SWAN: force-closed {symbol}")
+            return True
+        return False
+
+    def _handle_high_roi(self, symbol: str, pos: dict, current_price: float) -> bool:
+        """若 ROI 超过高盈利阈值，执行部分减仓（50%）。返回 True 表示已操作。"""
+        roi = self._get_roi(pos.get("entry_price", 0), current_price)
+        if roi >= CFG.HIGH_ROI_THRESHOLD:
+            scale_qty = pos["size"] * 0.5
+            logger.info(
+                f"[Trailing] high ROI {roi:.2%} on {symbol}, scaling out 50% "
+                f"({scale_qty:.6f})"
+            )
+            self.position.close_long(symbol, quantity=scale_qty)
+            notify(f"💰 HIGH ROI {roi:.2%}: scaled out 50% of {symbol}")
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Per-position logic
+    # ------------------------------------------------------------------
+
+    def _evaluate_one(self, pos: dict) -> None:
+        symbol = pos["symbol"]
+        try:
+            # 1. 黑天鹅检测（优先级最高）
+            if self._handle_black_swan(symbol):
+                return
+
+            # 2. 抓取快照
+            snapshot = self.fetcher.snapshot(symbol)
+            current_price = snapshot.get("price", {}).get("current_price", 0)
+
+            # 3. 高盈利止盈
+            if current_price and self._handle_high_roi(symbol, pos, current_price):
+                return
+
+            # 4. AI 评估
+            decision = self.evaluator.evaluate_hold(symbol, snapshot)
+            action = decision.get("action", "hold")
+            p_up = decision.get("p_up", 0.5)
+            reason = decision.get("key_reason", "")
+
+            if action == "close":
+                logger.info(f"[Trailing] AI says CLOSE {symbol}: {reason}")
+                self.position.close_long(symbol)
+                notify(f"📉 CLOSE {symbol} (AI): {reason}")
+
+            elif action == "scale_out":
+                scale_pct = float(decision.get("scale_out_pct", 0))
+                # 约束在合理范围内
+                scale_pct = max(CFG.SCALE_OUT_PCT_RANGE[0],
+                                min(scale_pct, CFG.SCALE_OUT_PCT_RANGE[1]))
+                scale_qty = pos["size"] * scale_pct
+                logger.info(
+                    f"[Trailing] AI says SCALE_OUT {symbol} {scale_pct:.0%}: {reason}"
+                )
+                self.position.close_long(symbol, quantity=scale_qty)
+                notify(f"📊 SCALE OUT {scale_pct:.0%} of {symbol} (AI): {reason}")
+
+            else:  # hold
+                logger.debug(
+                    f"[Trailing] HOLD {symbol} p_up={p_up:.2f}: {reason}"
+                )
+
+        except Exception as exc:
+            logger.error(f"[Trailing] _evaluate_one crashed for {symbol}: {exc}")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def evaluate_all(self) -> None:
+        """遍历所有当前持仓并执行追踪逻辑。"""
+        positions = self.position.get_positions()
+        if not positions:
+            logger.debug("[Trailing] no open positions to evaluate")
+            return
+        logger.info(f"[Trailing] evaluating {len(positions)} position(s)")
+        for pos in positions:
+            self._evaluate_one(pos)
