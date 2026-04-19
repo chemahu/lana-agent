@@ -37,6 +37,7 @@ class TradingConfig:
     HOLD_P_UP_MARGIN: float = 0.1
     SCALE_OUT_PCT_RANGE: tuple = (0.1, 0.9)
     HIGH_ROI_THRESHOLD: float = 1.0
+    BREAKEVEN_ROI_TRIGGER: float = 0.05  # 浮盈达此比例时将止损移至保本价
 
     # —— 仓位限制 ——
     MAX_OPEN_POSITIONS: int = 5

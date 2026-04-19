@@ -251,6 +251,65 @@ class PositionManager:
                 f"[PositionManager] adjust stop orders failed for {symbol}: {exc}"
             )
 
+    def move_stop_to_breakeven(self, symbol: str, entry_price: float, size: float) -> None:
+        """将止损单移至保本价（开仓均价），保护浮盈不变为浮亏。
+
+        遍历当前 reduceOnly stop_market 挂单：
+        - 若已有止损挂单价格 ≥ entry_price，说明已在保本或更优位置，跳过不动。
+        - 否则撤销所有旧止损，重新以 entry_price 为止损价挂单。
+
+        Parameters
+        ----------
+        symbol:
+            合约标的。
+        entry_price:
+            开仓均价，作为保本止损价格。
+        size:
+            当前持仓数量，用于重新挂单。
+        """
+        if CFG.DRY_RUN:
+            logger.info(
+                f"[PositionManager][DRY-RUN] would move stop to breakeven "
+                f"for {symbol} @ {entry_price:.6f}"
+            )
+            return
+        try:
+            open_orders = self._exchange.fetch_open_orders(symbol)
+            orders_to_cancel = []
+            for order in open_orders:
+                if (
+                    order.get("type") in ("stop_market", "stop")
+                    and order.get("reduceOnly")
+                    and order.get("side", "").lower() == "sell"
+                ):
+                    stop_price = float(
+                        order.get("stopPrice")
+                        or order.get("info", {}).get("stopPrice", 0)
+                        or 0
+                    )
+                    # 止损已在保本价或更优，无需移动
+                    if stop_price >= entry_price:
+                        continue
+                    orders_to_cancel.append(order["id"])
+
+            for oid in orders_to_cancel:
+                self._exchange.cancel_order(oid, symbol)
+                logger.info(f"[PositionManager] cancelled stop order {oid} for breakeven move")
+
+            new_stop = self._exchange.create_order(
+                symbol=symbol,
+                type="stop_market",
+                side="sell",
+                amount=size,
+                params={"stopPrice": entry_price, "reduceOnly": True},
+            )
+            logger.info(
+                f"[PositionManager] BREAKEVEN stop set for {symbol} "
+                f"@ {entry_price:.6f} orderId={new_stop.get('id')}"
+            )
+        except Exception as exc:
+            logger.error(f"[PositionManager] move_stop_to_breakeven failed for {symbol}: {exc}")
+
     # ------------------------------------------------------------------
     # Close
     # ------------------------------------------------------------------

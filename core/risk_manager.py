@@ -33,14 +33,20 @@ class RiskManager:
             "is_new_coin": is_new,
         }
 
-    def check_black_swan(self, symbol: str) -> bool:
+    def check_black_swan(self, symbol: str, entry_price: float = 0) -> bool:
+        """检测黑天鹅（闪跌）。
+
+        以 ``entry_price`` 为基准计算回撤比例：即过去 N 分钟最低价相对于开仓
+        均价的跌幅。若未传入 ``entry_price`` 则退化为原逻辑（以窗口内最高价为
+        基准），但这会导致在极端行情 K 线后新开仓即被误判，应尽量避免。
+        """
         try:
             ohlcv = self.fetcher.exchange.fetch_ohlcv(symbol, "1m", limit=5)
-            highs = [c[2] for c in ohlcv]
             lows = [c[3] for c in ohlcv]
-            drawdown = min(lows) / max(highs) - 1
+            baseline = entry_price if entry_price > 0 else max(c[2] for c in ohlcv)
+            drawdown = min(lows) / baseline - 1
             if drawdown <= -CFG.FLASH_CRASH_PCT:
-                logger.warning(f"BLACK SWAN on {symbol}: {drawdown:.2%}")
+                logger.warning(f"BLACK SWAN on {symbol}: {drawdown:.2%} (baseline={baseline})")
                 return True
         except Exception as e:
             logger.error(f"black swan check failed: {e}")

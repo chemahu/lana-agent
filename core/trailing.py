@@ -45,9 +45,9 @@ class TrailingEvaluator:
             return 0.0
         return (current_price - entry_price) / entry_price
 
-    def _handle_black_swan(self, symbol: str) -> bool:
+    def _handle_black_swan(self, symbol: str, entry_price: float = 0) -> bool:
         """检测黑天鹅并执行紧急平仓。返回 True 表示已触发。"""
-        if self.risk.check_black_swan(symbol):
+        if self.risk.check_black_swan(symbol, entry_price):
             logger.warning(f"[Trailing] BLACK SWAN detected on {symbol}, closing position")
             self.position.close_long(symbol)
             notify(f"⚠️ BLACK SWAN: force-closed {symbol}")
@@ -68,26 +68,50 @@ class TrailingEvaluator:
             return True
         return False
 
+    def _handle_breakeven(self, symbol: str, pos: dict, current_price: float) -> None:
+        """若浮盈达到保本触发阈值，将止损单移至开仓均价，保护浮盈不变为浮亏。"""
+        entry_price = pos.get("entry_price", 0)
+        if entry_price <= 0:
+            return
+        roi = self._get_roi(entry_price, current_price)
+        if roi >= CFG.BREAKEVEN_ROI_TRIGGER:
+            logger.info(
+                f"[Trailing] breakeven triggered for {symbol} "
+                f"(ROI={roi:.2%}), moving stop to entry {entry_price:.6f}"
+            )
+            self.position.move_stop_to_breakeven(symbol, entry_price, pos["size"])
+            notify(
+                f"🔒 BREAKEVEN: moved stop to entry {entry_price:.6f} "
+                f"for {symbol} (ROI={roi:.2%})"
+            )
+
     # ------------------------------------------------------------------
     # Per-position logic
     # ------------------------------------------------------------------
 
     def _evaluate_one(self, pos: dict) -> None:
         symbol = pos["symbol"]
+        entry_price = pos.get("entry_price", 0)
         try:
-            # 1. 黑天鹅检测（优先级最高）
-            if self._handle_black_swan(symbol):
+            # 1. 黑天鹅检测（优先级最高，以开仓均价为基准避免刻舟求剑误判）
+            if self._handle_black_swan(symbol, entry_price):
                 return
 
             # 2. 抓取快照
             snapshot = self.fetcher.snapshot(symbol)
             current_price = snapshot.get("price", {}).get("current_price", 0)
 
-            # 3. 高盈利止盈
-            if current_price and self._handle_high_roi(symbol, pos, current_price):
+            if not current_price:
                 return
 
-            # 4. AI 评估
+            # 3. 高盈利止盈
+            if self._handle_high_roi(symbol, pos, current_price):
+                return
+
+            # 4. 保本止损（浮盈达阈值则将止损移至开仓均价，保护浮盈不变浮亏）
+            self._handle_breakeven(symbol, pos, current_price)
+
+            # 5. AI 评估
             decision = self.evaluator.evaluate_hold(symbol, snapshot)
             action = decision.get("action", "hold")
             p_up = decision.get("p_up", 0.5)
