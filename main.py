@@ -38,7 +38,7 @@ class LanaAgent:
             if decision["should_enter"]:
                 result = self.position.open_long(symbol)
                 if result:
-                    notify(f"OPEN LONG {symbol} entry={{result.get('entry_price','?')}} stop={{result['stop_price']:.6f}} reason={{decision['key_reason']}}")
+                    notify(f"OPEN LONG {symbol} reason={{decision['key_reason']}}")
 
     def trailing_check(self):
         logger.info("-" * 60)
@@ -54,13 +54,11 @@ class LanaAgent:
         self.trailing_check()
         schedule.every(CFG.SCAN_INTERVAL_MINUTES).minutes.do(self.scan_and_enter)
         schedule.every(CFG.EVALUATION_INTERVAL_MINUTES).minutes.do(self.trailing_check)
-        logger.info(f"scheduler running: scan/{{CFG.SCAN_INTERVAL_MINUTES}}min trailing/{{CFG.EVALUATION_INTERVAL_MINUTES}}min")
         while True:
             try:
                 schedule.run_pending()
                 time.sleep(10)
             except KeyboardInterrupt:
-                logger.info("shutting down")
                 notify("Lana Agent stopped")
                 break
             except Exception as e:
