@@ -58,6 +58,21 @@ class TradingConfig:
     STOP_SLIPPAGE_BUFFER_PCT: float = 0.005
     NEW_COIN_STOP_SLIPPAGE_BUFFER_PCT: float = 0.015
 
+    # —— 自适应止损（ATR based）——
+    # 用过去 ATR_PERIOD 根 1h K 线的均幅（ATR）× ATR_MULTIPLIER / 入场价 作为止损幅度，
+    # 避免固定 2% 在高波动行情中被频繁扫损。结果被夹紧在 [MIN_STOP_PCT, MAX_STOP_PCT]。
+    # 新币强制以 NEW_COIN_MIN_STOP_PCT 为下限。
+    ATR_PERIOD: int = 14
+    ATR_MULTIPLIER: float = 1.5
+    MIN_STOP_PCT: float = 0.01
+    MAX_STOP_PCT: float = 0.08
+    NEW_COIN_MIN_STOP_PCT: float = 0.04
+
+    # —— 订单执行二次验证 ——
+    # open_long / close_long 下单后轮询持仓，确认成交落地；未能确认时发出告警而不阻塞。
+    ORDER_VERIFY_RETRIES: int = 3
+    ORDER_VERIFY_DELAY_SEC: float = 2.0
+
     # —— 运行模式 ——
     TESTNET: bool = False
     DRY_RUN: bool = False

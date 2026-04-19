@@ -1,4 +1,5 @@
 """仓位管理：开仓、平仓、查询持仓，通过 Binance 合约接口执行。"""
+import time
 from typing import Dict, List, Optional
 
 from loguru import logger
@@ -84,6 +85,51 @@ class PositionManager:
         return None
 
     # ------------------------------------------------------------------
+    # Order verification helpers
+    # ------------------------------------------------------------------
+
+    def _verify_position_open(self, symbol: str) -> bool:
+        """验证开仓指令已成交：轮询持仓确认数量大于 0。
+
+        最多重试 ``CFG.ORDER_VERIFY_RETRIES`` 次，每次间隔
+        ``CFG.ORDER_VERIFY_DELAY_SEC`` 秒。未能确认时记录告警但不阻塞流程。
+        """
+        for attempt in range(CFG.ORDER_VERIFY_RETRIES):
+            pos = self.get_position(symbol)
+            if pos is not None and pos["size"] > 0:
+                logger.info(
+                    f"[PositionManager] open confirmed for {symbol} "
+                    f"size={pos['size']:.6f} entry={pos['entry_price']}"
+                )
+                return True
+            if attempt < CFG.ORDER_VERIFY_RETRIES - 1:
+                time.sleep(CFG.ORDER_VERIFY_DELAY_SEC)
+        logger.warning(
+            f"[PositionManager] open NOT confirmed for {symbol} "
+            f"after {CFG.ORDER_VERIFY_RETRIES} retries"
+        )
+        return False
+
+    def _verify_position_closed(self, symbol: str) -> bool:
+        """验证全仓平仓已成交：轮询持仓确认已归零。
+
+        最多重试 ``CFG.ORDER_VERIFY_RETRIES`` 次，每次间隔
+        ``CFG.ORDER_VERIFY_DELAY_SEC`` 秒。未能确认时记录告警但不阻塞流程。
+        """
+        for attempt in range(CFG.ORDER_VERIFY_RETRIES):
+            pos = self.get_position(symbol)
+            if pos is None or pos["size"] <= 0:
+                logger.info(f"[PositionManager] close confirmed for {symbol}")
+                return True
+            if attempt < CFG.ORDER_VERIFY_RETRIES - 1:
+                time.sleep(CFG.ORDER_VERIFY_DELAY_SEC)
+        logger.warning(
+            f"[PositionManager] close NOT confirmed for {symbol} "
+            f"after {CFG.ORDER_VERIFY_RETRIES} retries"
+        )
+        return False
+
+    # ------------------------------------------------------------------
     # Open
     # ------------------------------------------------------------------
 
@@ -159,6 +205,9 @@ class PositionManager:
                 )
             except Exception as sl_exc:
                 logger.warning(f"[PositionManager] stop-loss order failed for {symbol}: {sl_exc}")
+
+            # 二次验证：确认开仓已成交
+            self._verify_position_open(symbol)
 
             return order
 
@@ -368,6 +417,8 @@ class PositionManager:
                         f"cancelling all stop orders"
                     )
                 self._cancel_open_stop_orders(symbol)
+                # 二次验证：全仓平仓确认持仓归零
+                self._verify_position_closed(symbol)
             else:
                 self._adjust_stop_orders(symbol, remaining_qty)
 

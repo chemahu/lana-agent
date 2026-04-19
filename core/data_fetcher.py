@@ -90,6 +90,33 @@ class DataFetcher:
                     "unique_authors": 0, "bullish_tag_ratio": 0.5,
                     "kol_mentioned": False, "trade_widget_count": 0}
 
+    def get_volume_features(self, symbol: str) -> Dict:
+        """获取成交量特征（市场快照第5维）。"""
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, "1h", limit=25)
+            volumes = [c[5] for c in ohlcv]
+            if len(volumes) < 2:
+                raise ValueError("insufficient OHLCV data for volume features")
+            last_vol = volumes[-1]
+            prev_vol = volumes[-2]
+            # 用除最新 K 线外的所有历史 K 线计算均量，排除当前未完成的 K 线
+            historical = volumes[:-1]
+            avg_vol = sum(historical) / len(historical) if historical else last_vol or 1
+            return {
+                "volume_1h": last_vol,
+                "volume_change_1h": (last_vol / prev_vol - 1) if prev_vol > 0 else 0.0,
+                "volume_vs_avg_24h": (last_vol / avg_vol) if avg_vol > 0 else 1.0,
+                "volume_24h_total": sum(volumes[-24:]) if len(volumes) >= 24 else sum(volumes),
+            }
+        except Exception as e:
+            logger.warning(f"volume features fetch failed for {symbol}: {e}")
+            return {
+                "volume_1h": 0,
+                "volume_change_1h": 0.0,
+                "volume_vs_avg_24h": 1.0,
+                "volume_24h_total": 0,
+            }
+
     def get_relative_features(self, symbol: str, gainers: List[Dict]) -> Dict:
         rank = next((i for i, g in enumerate(gainers, 1)
                      if g["symbol"] == symbol), 999)
@@ -103,6 +130,7 @@ class DataFetcher:
             "price": self.get_price_features(symbol),
             "derivatives": self.get_derivatives_features(symbol),
             "social": self.get_social_features(symbol),
+            "volume": self.get_volume_features(symbol),
             "relative": self.get_relative_features(symbol, gainers),
         }
 

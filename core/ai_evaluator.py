@@ -11,6 +11,7 @@ def _build_prompt(symbol: str, snapshot: Dict, mode: str = "entry") -> str:
     price = snapshot.get("price", {})
     deriv = snapshot.get("derivatives", {})
     social = snapshot.get("social", {})
+    volume = snapshot.get("volume", {})
     relative = snapshot.get("relative", {})
 
     lines = [
@@ -39,6 +40,12 @@ def _build_prompt(symbol: str, snapshot: Dict, mode: str = "entry") -> str:
         f"  bullish_tag_ratio : {social.get('bullish_tag_ratio', 0.5):.2f}",
         f"  kol_mentioned     : {social.get('kol_mentioned', False)}",
         f"  trade_widget_cnt  : {social.get('trade_widget_count', 0)}",
+        "",
+        "=== Volume ===",
+        f"  volume_1h           : {volume.get('volume_1h', 0):.0f}",
+        f"  volume_change_1h    : {volume.get('volume_change_1h', 0):.2%}",
+        f"  volume_vs_avg_24h   : {volume.get('volume_vs_avg_24h', 1.0):.2f}x",
+        f"  volume_24h_total    : {volume.get('volume_24h_total', 0):.0f}",
         "",
         "=== Relative ===",
         f"  rank_in_gainers : {relative.get('rank', relative.get('rank_in_gainers', 'N/A'))}",

@@ -9,6 +9,39 @@ class RiskManager:
     def __init__(self, fetcher: DataFetcher):
         self.fetcher = fetcher
 
+    def _calc_atr_stop_pct(self, symbol: str, entry_price: float) -> float:
+        """基于 ATR 计算自适应止损幅度，避免止损过窄被频繁扫损。
+
+        用过去 ``CFG.ATR_PERIOD`` 根 1h K 线的平均真实幅度（ATR）乘以
+        ``CFG.ATR_MULTIPLIER``，再除以入场价，得到止损比例。结果夹紧在
+        ``[CFG.MIN_STOP_PCT, CFG.MAX_STOP_PCT]`` 区间内。
+
+        若 ATR 拉取失败，回退到最小止损比例 ``CFG.MIN_STOP_PCT``。
+        """
+        try:
+            ohlcv = self.fetcher.exchange.fetch_ohlcv(
+                symbol, "1h", limit=CFG.ATR_PERIOD + 1
+            )
+            trs = []
+            for i in range(1, len(ohlcv)):
+                high = ohlcv[i][2]
+                low = ohlcv[i][3]
+                prev_close = ohlcv[i - 1][4]
+                tr = max(
+                    high - low,
+                    abs(high - prev_close),
+                    abs(low - prev_close),
+                )
+                trs.append(tr)
+            if not trs or entry_price <= 0:
+                return CFG.MIN_STOP_PCT
+            atr = sum(trs) / len(trs)
+            stop_pct = (atr * CFG.ATR_MULTIPLIER) / entry_price
+            return max(CFG.MIN_STOP_PCT, min(stop_pct, CFG.MAX_STOP_PCT))
+        except Exception as exc:
+            logger.warning(f"[RiskManager] ATR stop calc failed for {symbol}: {exc}")
+            return CFG.MIN_STOP_PCT
+
     def calc_position_size(self, symbol: str, account_equity: float,
                            entry_price: float, leverage: int) -> Dict:
         """计算开仓仓位大小并确定止损触发价格。
@@ -17,11 +50,16 @@ class RiskManager:
         与杠杆倍数无关：
 
             stop_price = entry_price × (1 - stop_pct)
-            普通币：stop_pct = 2%；新币（≤14 天）：stop_pct = 4%
 
-        示例（普通币，5× 杠杆，入场价 100 USDT）：
-            止损触发价 = 100 × (1 - 0.02) = 98 USDT  ← 价格下跌 2% 触发
-            若止损成交，保证金亏损 ≈ notional × 2% = margin × (2% × 5) = margin × 10%
+        止损幅度（stop_pct）由 ATR 自适应计算，夹紧在
+        ``[MIN_STOP_PCT, MAX_STOP_PCT]``：
+          - 普通币：ATR × ATR_MULTIPLIER / entry_price，下限 1%，上限 8%
+          - 新币（≤14 天）：同上但下限为 NEW_COIN_MIN_STOP_PCT（4%）
+
+        示例（普通币，5× 杠杆，入场价 100 USDT，ATR=2 USDT，1.5× 倍数）：
+            ATR 止损幅度 = 2 × 1.5 / 100 = 3%
+            止损触发价 = 100 × (1 - 0.03) = 97 USDT  ← 价格下跌 3% 触发
+            若止损成交，保证金亏损 ≈ notional × 3% = margin × (3% × 5) = margin × 15%
 
         账户净值层面的最大亏损上限由 max_loss 控制（= min(账户净值 ×
         MAX_RISK_PCT, MAX_LOSS_PER_TRADE_USDT)），通过反推仓位 notional 来
@@ -29,7 +67,7 @@ class RiskManager:
         亏损 ≈ max_loss，而不是账户净值的某个固定百分比乘以杠杆倍数。
 
         总结：
-          - 止损"幅度"= 合约价格跌幅（2% 或 4%），与杠杆无关。
+          - 止损"幅度"= ATR 自适应合约价格跌幅（与杠杆无关）。
           - 止损"金额"= 单笔 max_loss（账户净值 × 1%，上限 200 USDT），
             通过仓位 sizing 保证，而非依赖杠杆计算。
         """
@@ -38,8 +76,16 @@ class RiskManager:
         if is_new:
             max_loss *= CFG.NEW_COIN_LOSS_MULTIPLIER
             leverage = min(leverage, CFG.NEW_COIN_LEVERAGE)
-        # stop_pct 为合约价格跌幅触发比例（与杠杆无关）：普通币 2%，新币 4%
-        stop_pct = 0.04 if is_new else 0.02
+        # ATR 自适应止损幅度：新币下限为 4%，普通币下限为 MIN_STOP_PCT
+        atr_stop_pct = self._calc_atr_stop_pct(symbol, entry_price)
+        if is_new:
+            stop_pct = max(CFG.NEW_COIN_MIN_STOP_PCT, atr_stop_pct)
+        else:
+            stop_pct = atr_stop_pct
+        logger.info(
+            f"[RiskManager] {symbol} stop_pct={stop_pct:.2%} "
+            f"(ATR-based, is_new={is_new})"
+        )
         # sizing 时预留滑点冗余：按 (stop_pct + buffer) 反推 notional，
         # 这样即便 stopMarket 实际成交价比触发价滑落 buffer，单笔账户损失仍 ≈ max_loss。
         slippage_buffer = (
