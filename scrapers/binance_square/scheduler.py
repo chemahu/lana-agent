@@ -71,6 +71,7 @@ class SquareScheduler:
         self._page_size = page_size
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._last_prune_ts: float = 0.0  # Unix timestamp of last prune
 
     # ------------------------------------------------------------------
     # Internal fetch logic
@@ -128,13 +129,16 @@ class SquareScheduler:
         logger.info(
             f"[Scheduler] cycle complete — total new posts: {total_added}"
         )
-        # 每天清理一次旧数据（靠行数粗判，不精确但够用）
-        try:
-            pruned = self._storage.prune_old(keep_days=7)
-            if pruned:
-                logger.debug(f"[Scheduler] pruned {pruned} old posts")
-        except Exception as exc:
-            logger.warning(f"[Scheduler] prune failed: {exc}")
+        # 仅每 24 小时执行一次旧数据清理，避免每次循环都触发 DELETE
+        now = time.monotonic()
+        if now - self._last_prune_ts >= 86400:
+            try:
+                pruned = self._storage.prune_old(keep_days=7)
+                self._last_prune_ts = now
+                if pruned:
+                    logger.debug(f"[Scheduler] pruned {pruned} old posts")
+            except Exception as exc:
+                logger.warning(f"[Scheduler] prune failed: {exc}")
 
     # ------------------------------------------------------------------
     # Public API

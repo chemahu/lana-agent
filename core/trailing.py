@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from loguru import logger
 
@@ -86,7 +86,8 @@ class TrailingEvaluator:
         action: str = hold_result.get("action", "hold")
         confidence: float = float(hold_result.get("confidence", 0.0))
         key_reason: str = hold_result.get("key_reason", "")
-        scale_out_pct: float = float(hold_result.get("scale_out_pct") or 0.0)
+        raw_pct = hold_result.get("scale_out_pct")
+        scale_out_pct: Optional[float] = float(raw_pct) if raw_pct is not None else None
 
         logger.info(
             f"[Trailing] {symbol} primary → action={action} "
@@ -106,7 +107,8 @@ class TrailingEvaluator:
             action = ambiguous_result.get("action", action)
             confidence = float(ambiguous_result.get("confidence", confidence))
             key_reason = ambiguous_result.get("key_reason", key_reason)
-            scale_out_pct = float(ambiguous_result.get("scale_out_pct") or scale_out_pct)
+            raw_pct2 = ambiguous_result.get("scale_out_pct")
+            scale_out_pct = float(raw_pct2) if raw_pct2 is not None else scale_out_pct
             logger.info(
                 f"[Trailing] {symbol} after cross-check → action={action} "
                 f"confidence={confidence:.2f}"
@@ -125,7 +127,7 @@ class TrailingEvaluator:
         elif action == "scale_out":
             # clamp to configured range
             min_pct, max_pct = CFG.SCALE_OUT_PCT_RANGE
-            pct = max(min_pct, min(max_pct, scale_out_pct or min_pct))
+            pct = max(min_pct, min(max_pct, scale_out_pct if scale_out_pct is not None else min_pct))
             logger.info(
                 f"[Trailing] {symbol} → SCALE_OUT {pct:.0%} "
                 f"(reason={key_reason!r})"

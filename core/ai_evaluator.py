@@ -217,9 +217,10 @@ class AIEvaluator:
 
         若主模型为 Claude，则直接用 GPT；反之亦然。
         主 / 备结论一致则置信度加成，否则返回保守默认值。
+        该方法在持仓评估（evaluate_hold）模糊时调用，因此使用 _HOLD_SYSTEM 提示词。
         """
         user_content = _SNAPSHOT_TEMPLATE.format(snapshot=_fmt_snapshot(snapshot))
-        system = _ENTRY_SYSTEM.format(symbol=symbol)
+        system = _HOLD_SYSTEM.format(symbol=symbol)
 
         # 始终尝试备用模型
         backup_result: Optional[Dict] = None
@@ -237,13 +238,13 @@ class AIEvaluator:
                 logger.warning(f"[AIEvaluator] backup model failed: {exc}")
 
         if backup_result is None:
-            return dict(_DEFAULT_ENTRY)
+            return dict(_DEFAULT_HOLD)
 
         if primary_result is None:
             return backup_result
 
         # 两模型结论一致 → 置信度取平均并稍加权
-        if primary_result.get("should_enter") == backup_result.get("should_enter"):
+        if primary_result.get("action") == backup_result.get("action"):
             merged = dict(backup_result)
             merged["confidence"] = (
                 primary_result.get("confidence", 0) + backup_result.get("confidence", 0)
@@ -254,9 +255,9 @@ class AIEvaluator:
             )
             return merged
 
-        # 两模型结论不一致 → 拒绝进场
+        # 两模型结论不一致 → 保守持仓不动
         logger.info(
-            f"[AIEvaluator] ambiguous: primary={primary_result.get('should_enter')}, "
-            f"backup={backup_result.get('should_enter')} → reject"
+            f"[AIEvaluator] ambiguous: primary={primary_result.get('action')}, "
+            f"backup={backup_result.get('action')} → hold"
         )
-        return dict(_DEFAULT_ENTRY)
+        return dict(_DEFAULT_HOLD)

@@ -184,8 +184,9 @@ class PostStorage:
     def prune_old(self, keep_days: int = 7) -> int:
         """删除超过 keep_days 天的旧记录，返回删除行数。"""
         cutoff_ms = (
-            int(datetime.now(tz=timezone.utc).timestamp()) - keep_days * 86400
-        ) * 1000
+            int(datetime.now(tz=timezone.utc).timestamp()) * 1000
+            - keep_days * 86400 * 1000
+        )
         cur = self._conn.execute(
             "DELETE FROM posts WHERE created_at_ms IS NOT NULL AND created_at_ms<?",
             (cutoff_ms,),

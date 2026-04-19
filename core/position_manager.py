@@ -43,10 +43,12 @@ class PositionManager:
         """返回账户 USDT 权益（保证金余额）。"""
         try:
             balance = self._fetcher.exchange.fetch_balance()
-            return float(
-                balance.get("USDT", {}).get("free", 0)
-                or balance.get("total", {}).get("USDT", 0)
-            )
+            usdt = balance.get("USDT") or {}
+            free = usdt.get("free")
+            if free is not None:
+                return float(free)
+            total = (balance.get("total") or {}).get("USDT")
+            return float(total) if total is not None else 0.0
         except Exception as exc:
             logger.error(f"[PositionManager] get_equity failed: {exc}")
             return 0.0
