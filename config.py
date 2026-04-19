@@ -12,6 +12,7 @@ class TradingConfig:
     BINANCE_API_SECRET: str = os.getenv("BINANCE_API_SECRET", "")
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -39,6 +40,13 @@ class TradingConfig:
     HIGH_ROI_THRESHOLD: float = 1.0
     BREAKEVEN_ROI_TRIGGER: float = 0.05  # 浮盈达此比例时将止损移至保本价
 
+    # —— 会商记录 ——
+    # 每次 LLM 集成决策的完整输入/输出落盘到此 JSONL 文件，便于复盘。
+    # 路径相对工作目录；目录不存在时会自动创建。
+    CONSULTATION_LOG_PATH: str = os.getenv(
+        "CONSULTATION_LOG_PATH", "logs/consultations.jsonl"
+    )
+
     # —— 仓位限制 ——
     MAX_OPEN_POSITIONS: int = 5
 
@@ -57,6 +65,21 @@ class TradingConfig:
     # 最坏单笔账户回撤仍约等于 MAX_RISK_PCT；挂单触发价仍用 stop_pct，触发位置不变。
     STOP_SLIPPAGE_BUFFER_PCT: float = 0.005
     NEW_COIN_STOP_SLIPPAGE_BUFFER_PCT: float = 0.015
+
+    # —— 自适应止损（ATR based）——
+    # 用过去 ATR_PERIOD 根 1h K 线的均幅（ATR）× ATR_MULTIPLIER / 入场价 作为止损幅度，
+    # 避免固定 2% 在高波动行情中被频繁扫损。结果被夹紧在 [MIN_STOP_PCT, MAX_STOP_PCT]。
+    # 新币强制以 NEW_COIN_MIN_STOP_PCT 为下限。
+    ATR_PERIOD: int = 14
+    ATR_MULTIPLIER: float = 1.5
+    MIN_STOP_PCT: float = 0.01
+    MAX_STOP_PCT: float = 0.08
+    NEW_COIN_MIN_STOP_PCT: float = 0.04
+
+    # —— 订单执行二次验证 ——
+    # open_long / close_long 下单后轮询持仓，确认成交落地；未能确认时发出告警而不阻塞。
+    ORDER_VERIFY_RETRIES: int = 3
+    ORDER_VERIFY_DELAY_SEC: float = 2.0
 
     # —— 运行模式 ——
     TESTNET: bool = False
