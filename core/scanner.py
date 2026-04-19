@@ -34,7 +34,8 @@ class Scanner:
             if (social["posts_1h"] < CFG.MIN_SOCIAL_POSTS_1H
                     or social["unique_authors"] < CFG.MIN_UNIQUE_AUTHORS
                     or social["posts_growth_rate"] < CFG.MIN_POSTS_GROWTH):
-                logger.debug(f"{symbol} weak social, kept for ranking")
+                logger.debug(f"{symbol} failed social filter; skipping")
+                continue
 
             candidates.append({
                 "symbol": symbol,
