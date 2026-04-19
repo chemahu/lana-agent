@@ -1,6 +1,16 @@
-"""AI 决策评估器：调用 LLM（Claude 或 OpenAI）对标的做入场 / 持仓判断。"""
+"""AI 决策评估器：调用最多 3 个 LLM（Anthropic Claude / OpenAI GPT / Google Gemini）
+并通过集成投票（majority vote + 概率均值）形成最终交易判断。
+
+集成思路（更容易根据结果判断交易操作）：
+  - 每个已配置的 LLM 都会被调用一次，得到独立的 JSON 决策；
+  - 入场 should_enter / 持仓 action 采用多数投票；
+  - p_up、confidence、scale_out_pct 取算术均值；
+  - key_reason / risks 拼接所有模型的简要理由，便于人工复盘；
+  - 投票一致 → 高把握执行；分歧 → 自动降低 confidence，由阈值过滤；
+  - 全部 LLM 调用失败时回退到内置规则引擎。
+"""
 import json
-from typing import Dict, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -91,58 +101,204 @@ def _parse_json_response(text: str) -> Dict:
 
 
 class AIEvaluator:
-    """调用 Anthropic Claude 或 OpenAI GPT 对标的做评估。
+    """调用最多 3 个 LLM（Anthropic Claude / OpenAI GPT / Google Gemini）
+    对标的做评估，并通过集成投票生成最终结果。
 
-    优先尝试 Anthropic；若未配置 ANTHROPIC_API_KEY 则回落到 OpenAI；
-    两者都未配置则使用内置规则引擎作为兜底。
+    每个 LLM 互相独立调用、互相对照；
+    至少配置任一 API Key 即启用对应模型，全部缺失则使用规则引擎兜底。
     """
 
     def __init__(self) -> None:
         self._anthropic_client: Optional[object] = None
         self._openai_client: Optional[object] = None
+        self._gemini_client: Optional[object] = None
 
         if CFG.ANTHROPIC_API_KEY:
             try:
                 import anthropic  # type: ignore
                 self._anthropic_client = anthropic.Anthropic(api_key=CFG.ANTHROPIC_API_KEY)
-                logger.info("[AIEvaluator] using Anthropic Claude")
+                logger.info("[AIEvaluator] Anthropic Claude enabled")
             except Exception as exc:
                 logger.warning(f"[AIEvaluator] Anthropic init failed: {exc}")
 
-        if not self._anthropic_client and CFG.OPENAI_API_KEY:
+        if CFG.OPENAI_API_KEY:
             try:
                 from openai import OpenAI  # type: ignore
                 self._openai_client = OpenAI(api_key=CFG.OPENAI_API_KEY)
-                logger.info("[AIEvaluator] using OpenAI GPT")
+                logger.info("[AIEvaluator] OpenAI GPT enabled")
             except Exception as exc:
                 logger.warning(f"[AIEvaluator] OpenAI init failed: {exc}")
 
-        if not self._anthropic_client and not self._openai_client:
+        if CFG.GEMINI_API_KEY:
+            try:
+                import google.generativeai as genai  # type: ignore
+                genai.configure(api_key=CFG.GEMINI_API_KEY)
+                self._gemini_client = genai.GenerativeModel("gemini-1.5-flash")
+                logger.info("[AIEvaluator] Google Gemini enabled")
+            except Exception as exc:
+                logger.warning(f"[AIEvaluator] Gemini init failed: {exc}")
+
+        active = sum(1 for c in (self._anthropic_client,
+                                  self._openai_client,
+                                  self._gemini_client) if c)
+        if active == 0:
             logger.warning("[AIEvaluator] no LLM configured – using rule-based fallback")
+        else:
+            logger.info(f"[AIEvaluator] ensemble active with {active} LLM(s)")
 
     # ------------------------------------------------------------------
-    # Internal: call LLM
+    # Internal: per-model callers
     # ------------------------------------------------------------------
 
-    def _call_llm(self, prompt: str) -> str:
+    def _call_anthropic(self, prompt: str) -> str:
+        resp = self._anthropic_client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text
+
+    def _call_openai(self, prompt: str) -> str:
+        resp = self._openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        return resp.choices[0].message.content
+
+    def _call_gemini(self, prompt: str) -> str:
+        resp = self._gemini_client.generate_content(prompt)
+        # Gemini SDK exposes .text on success; empty/missing means a refusal or
+        # safety block — surface it as an error so _gather_results drops this
+        # vote instead of producing a JSON-parse failure downstream.
+        text = getattr(resp, "text", "") or ""
+        if not text.strip():
+            raise RuntimeError("gemini returned empty response")
+        return text
+
+    def _active_callers(self) -> List[Tuple[str, Callable[[str], str]]]:
+        """返回所有已配置的 (模型名, 调用函数) 列表。"""
+        callers: List[Tuple[str, Callable[[str], str]]] = []
         if self._anthropic_client:
-            resp = self._anthropic_client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=256,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return resp.content[0].text
-
+            callers.append(("anthropic", self._call_anthropic))
         if self._openai_client:
-            resp = self._openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                max_tokens=256,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-            )
-            return resp.choices[0].message.content
+            callers.append(("openai", self._call_openai))
+        if self._gemini_client:
+            callers.append(("gemini", self._call_gemini))
+        return callers
 
-        raise RuntimeError("No LLM client available")
+    def _gather_results(self, prompt: str) -> List[Tuple[str, Dict]]:
+        """依次调用所有已配置的 LLM，返回 [(模型名, 解析后的 dict), ...]。"""
+        results: List[Tuple[str, Dict]] = []
+        for name, caller in self._active_callers():
+            try:
+                raw = caller(prompt)
+                parsed = _parse_json_response(raw)
+                results.append((name, parsed))
+            except Exception as exc:
+                logger.warning(f"[AIEvaluator] {name} call failed: {exc}")
+        return results
+
+    # ------------------------------------------------------------------
+    # Aggregation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _avg(values: List[float], default: float) -> float:
+        nums = [float(v) for v in values if isinstance(v, (int, float))]
+        return sum(nums) / len(nums) if nums else default
+
+    @staticmethod
+    def _majority_vote(values: List, default):
+        """简单多数投票。
+
+        Parameters
+        ----------
+        values:
+            待投票的取值列表（每个元素代表一个模型的选择）。
+        default:
+            ``values`` 为空时返回的默认值。
+
+        Returns
+        -------
+        (winner, win_count, total): tuple
+            * ``winner`` —— 票数最多的取值；并列时取第一个出现的值（稳定）。
+            * ``win_count`` —— 获胜取值的票数。
+            * ``total`` —— 参与投票的总票数。
+        """
+        counts: Dict = {}
+        for v in values:
+            counts[v] = counts.get(v, 0) + 1
+        if not counts:
+            return default, 0, 0
+        winner = max(counts.items(), key=lambda kv: kv[1])
+        return winner[0], winner[1], len(values)
+
+    @classmethod
+    def _aggregate_entry(cls, results: List[Tuple[str, Dict]]) -> Dict:
+        """集成入场决策：should_enter 多数投票，p_up/confidence 取均值。"""
+        if not results:
+            raise RuntimeError("no LLM results to aggregate")
+
+        votes = [bool(r.get("should_enter", False)) for _, r in results]
+        winner, win_count, total = cls._majority_vote(votes, False)
+
+        p_up = cls._avg([r.get("p_up", 0.5) for _, r in results], 0.5)
+        confidence = cls._avg([r.get("confidence", 0.5) for _, r in results], 0.5)
+        # 投票分歧时降低 confidence（按一致比例线性缩放）
+        agreement = win_count / total if total else 1.0
+        confidence *= agreement
+
+        reason = " | ".join(
+            f"{name}:{(r.get('key_reason') or '')[:60]}" for name, r in results
+        )
+        risks = " | ".join(
+            f"{name}:{(r.get('risks') or '')[:60]}" for name, r in results
+        )
+        return {
+            "should_enter": bool(winner),
+            "p_up": round(max(0.0, min(1.0, p_up)), 3),
+            "confidence": round(max(0.0, min(1.0, confidence)), 3),
+            "key_reason": reason[:240],
+            "risks": risks[:240],
+            "votes": {
+                "agreement": round(agreement, 3),
+                "models": [name for name, _ in results],
+            },
+        }
+
+    @classmethod
+    def _aggregate_hold(cls, results: List[Tuple[str, Dict]]) -> Dict:
+        """集成持仓决策：action 多数投票，scale_out_pct/p_up 取均值。"""
+        if not results:
+            raise RuntimeError("no LLM results to aggregate")
+
+        actions = [str(r.get("action", "hold")).lower() for _, r in results]
+        winner, win_count, total = cls._majority_vote(actions, "hold")
+
+        scale_out_pct = cls._avg(
+            [r.get("scale_out_pct", 0.0) for _, r in results], 0.0
+        )
+        p_up = cls._avg([r.get("p_up", 0.5) for _, r in results], 0.5)
+        confidence = cls._avg([r.get("confidence", 0.5) for _, r in results], 0.5)
+        agreement = win_count / total if total else 1.0
+        confidence *= agreement
+
+        reason = " | ".join(
+            f"{name}:{(r.get('key_reason') or '')[:60]}" for name, r in results
+        )
+        return {
+            "action": winner,
+            "scale_out_pct": round(max(0.0, min(1.0, scale_out_pct)), 3),
+            "p_up": round(max(0.0, min(1.0, p_up)), 3),
+            "confidence": round(max(0.0, min(1.0, confidence)), 3),
+            "key_reason": reason[:240],
+            "votes": {
+                "agreement": round(agreement, 3),
+                "models": [name for name, _ in results],
+            },
+        }
 
     # ------------------------------------------------------------------
     # Rule-based fallback
@@ -193,27 +349,35 @@ class AIEvaluator:
     def evaluate_entry(self, symbol: str, snapshot: Dict) -> Dict:
         """判断是否入场。返回包含 should_enter / p_up / key_reason 的字典。"""
         try:
+            if not self._active_callers():
+                return self._rule_entry(snapshot)
             prompt = _build_prompt(symbol, snapshot, mode="entry")
-            raw = self._call_llm(prompt)
-            result = _parse_json_response(raw)
-            # ensure required keys exist
+            results = self._gather_results(prompt)
+            if not results:
+                logger.error(
+                    f"[AIEvaluator] all LLMs failed for entry {symbol}; "
+                    "falling back to rule engine"
+                )
+                return self._rule_entry(snapshot)
+            result = self._aggregate_entry(results)
+            # ensure required keys exist (defensive)
             result.setdefault("should_enter", False)
             result.setdefault("p_up", 0.5)
             result.setdefault("confidence", 0.5)
             result.setdefault("key_reason", "")
             result.setdefault("risks", "")
-            # enforce thresholds
+            # enforce thresholds (集成后 confidence 已被一致性缩放，再过一次阈值)
             if (result["p_up"] < CFG.ENTRY_P_UP_THRESHOLD
                     or result["confidence"] < CFG.ENTRY_CONFIDENCE_THRESHOLD):
                 result["should_enter"] = False
             logger.info(
                 f"[AIEvaluator] entry {symbol}: should_enter={result['should_enter']} "
                 f"p_up={result['p_up']:.2f} conf={result['confidence']:.2f} "
+                f"agreement={result.get('votes', {}).get('agreement', 1.0):.2f} "
+                f"models={result.get('votes', {}).get('models', [])} "
                 f"reason={result['key_reason']!r}"
             )
             return result
-        except RuntimeError:
-            return self._rule_entry(snapshot)
         except Exception as exc:
             logger.error(f"[AIEvaluator] evaluate_entry failed for {symbol}: {exc}")
             return self._rule_entry(snapshot)
@@ -221,9 +385,17 @@ class AIEvaluator:
     def evaluate_hold(self, symbol: str, snapshot: Dict) -> Dict:
         """判断持仓标的是继续持有、部分减仓还是全部平仓。"""
         try:
+            if not self._active_callers():
+                return self._rule_hold(snapshot)
             prompt = _build_prompt(symbol, snapshot, mode="hold")
-            raw = self._call_llm(prompt)
-            result = _parse_json_response(raw)
+            results = self._gather_results(prompt)
+            if not results:
+                logger.error(
+                    f"[AIEvaluator] all LLMs failed for hold {symbol}; "
+                    "falling back to rule engine"
+                )
+                return self._rule_hold(snapshot)
+            result = self._aggregate_hold(results)
             result.setdefault("action", "hold")
             result.setdefault("scale_out_pct", 0.0)
             result.setdefault("p_up", 0.5)
@@ -231,11 +403,12 @@ class AIEvaluator:
             result.setdefault("key_reason", "")
             logger.info(
                 f"[AIEvaluator] hold {symbol}: action={result['action']} "
-                f"p_up={result['p_up']:.2f} reason={result['key_reason']!r}"
+                f"p_up={result['p_up']:.2f} conf={result['confidence']:.2f} "
+                f"agreement={result.get('votes', {}).get('agreement', 1.0):.2f} "
+                f"models={result.get('votes', {}).get('models', [])} "
+                f"reason={result['key_reason']!r}"
             )
             return result
-        except RuntimeError:
-            return self._rule_hold(snapshot)
         except Exception as exc:
             logger.error(f"[AIEvaluator] evaluate_hold failed for {symbol}: {exc}")
             return self._rule_hold(snapshot)
