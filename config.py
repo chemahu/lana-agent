@@ -52,6 +52,12 @@ class TradingConfig:
     FLASH_CRASH_WINDOW_MIN: int = 5
     API_FAILURE_TIMEOUT_SEC: int = 180
 
+    # —— 止损滑点冗余 ——
+    # sizing 时按 (stop_pct + buffer) 反推仓位，确保在 stopMarket 出现滑点时
+    # 最坏单笔账户回撤仍约等于 MAX_RISK_PCT；挂单触发价仍用 stop_pct，触发位置不变。
+    STOP_SLIPPAGE_BUFFER_PCT: float = 0.005
+    NEW_COIN_STOP_SLIPPAGE_BUFFER_PCT: float = 0.015
+
     # —— 运行模式 ——
     TESTNET: bool = False
     DRY_RUN: bool = False

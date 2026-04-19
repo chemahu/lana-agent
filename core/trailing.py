@@ -45,9 +45,14 @@ class TrailingEvaluator:
             return 0.0
         return (current_price - entry_price) / entry_price
 
-    def _handle_black_swan(self, symbol: str, entry_price: float = 0) -> bool:
+    def _handle_black_swan(
+        self,
+        symbol: str,
+        entry_price: float = 0,
+        current_price: float = 0,
+    ) -> bool:
         """检测黑天鹅并执行紧急平仓。返回 True 表示已触发。"""
-        if self.risk.check_black_swan(symbol, entry_price):
+        if self.risk.check_black_swan(symbol, entry_price, current_price):
             logger.warning(f"[Trailing] BLACK SWAN detected on {symbol}, closing position")
             self.position.close_long(symbol)
             notify(f"⚠️ BLACK SWAN: force-closed {symbol}")
@@ -93,13 +98,14 @@ class TrailingEvaluator:
         symbol = pos["symbol"]
         entry_price = pos.get("entry_price", 0)
         try:
-            # 1. 黑天鹅检测（优先级最高，以开仓均价为基准避免刻舟求剑误判）
-            if self._handle_black_swan(symbol, entry_price):
-                return
-
-            # 2. 抓取快照
+            # 1. 抓取快照（顺便拿到现价，给黑天鹅检测复用，省掉每轮的 1m K 线请求）
             snapshot = self.fetcher.snapshot(symbol)
             current_price = snapshot.get("price", {}).get("current_price", 0)
+
+            # 2. 黑天鹅检测（仍是第一道平仓判断；优先用 current_price 直比 entry_price，
+            #    snapshot 失败拿不到现价时回退到 K 线兜底路径）
+            if self._handle_black_swan(symbol, entry_price, current_price):
+                return
 
             if not current_price:
                 return
